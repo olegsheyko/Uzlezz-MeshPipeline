@@ -502,3 +502,5 @@ HRESULT Model::UploadGpuResources(ID3D12Device* device, ID3D12CommandQueue* cmdQ
 
     return S_OK;
 }
+
+

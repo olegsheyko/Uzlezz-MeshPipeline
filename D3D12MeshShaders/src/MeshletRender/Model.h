@@ -13,6 +13,7 @@
 #include "Span.h"
 
 #include <DirectXCollision.h>
+#include <iostream>
 
 struct Attribute
 {
@@ -132,7 +133,32 @@ struct Mesh
             return *reinterpret_cast<const uint16_t*>(addr);
         }
     }
+
+    D3D12_GPU_VIRTUAL_ADDRESS GetUVBufferAddress() const
+    {
+        // Попытка 1: Ищем по имени "TEXCOORD" (как и было)
+        std::cout << "DEBUG: LayoutElements: " << LayoutDesc.NumElements 
+              << ", VertexResources size: " << VertexResources.size() << std::endl;
+        for (uint32_t i = 0; i < LayoutDesc.NumElements; ++i)
+        {
+            if (strcmp(LayoutElems[i].SemanticName, "TEXCOORD") == 0)
+            {
+                uint32_t slot = LayoutElems[i].InputSlot;
+                if (slot < VertexResources.size()) return VertexResources[slot]->GetGPUVirtualAddress();
+            }
+        }
+
+        // Попытка 2: Если по имени не нашли, берем 3-й ресурс (индекс 2), 
+        // так как в структуре Attribute::Count порядок: Position(0), Normal(1), TexCoord(2)
+        if (VertexResources.size() > 2)
+        {
+            return VertexResources[2]->GetGPUVirtualAddress();
+        }
+
+        return 0; 
+    }
 };
+
 
 class Model
 {

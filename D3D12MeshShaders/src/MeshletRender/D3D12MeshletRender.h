@@ -80,11 +80,20 @@ private:
     ComPtr<ID3D12Fence> m_fence;
     UINT64 m_fenceValues[FrameCount];
 
+    ComPtr<ID3D12Resource> m_meshInfoResource; // (это уже есть в Model, но здесь свои ресурсы)
+
+    // --- ДОБАВИТЬ ЭТО ---
+    ComPtr<ID3D12Resource>       m_texture;          // Ресурс самой текстуры
+    ComPtr<ID3D12DescriptorHeap> m_srvHeap;          // Куча для хранения дескриптора текстуры
+    UINT                         m_srvDescriptorSize;// Размер дескриптора
+
     void LoadPipeline();
     void LoadAssets();
     void PopulateCommandList();
     void MoveToNextFrame();
     void WaitForGpu();
+    std::vector<UINT8> GenerateTextureData();
+    void CreateTextureResources();      
 
 private:
     static const wchar_t* c_meshFilename;
