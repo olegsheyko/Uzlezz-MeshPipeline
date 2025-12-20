@@ -517,8 +517,8 @@ void D3D12MeshletRender::MoveToNextFrame()
 std::vector<UINT8> D3D12MeshletRender::GenerateTextureData()
 {
     const UINT rowPitch = 256 * 4; // Ширина 256 пикселей, 4 байта (RGBA)
-    const UINT cellPitch = rowPitch >> 3; // Размер клетки
-    const UINT cellHeight = 256 >> 3;
+    const UINT cellPitch = rowPitch >> 1; // Размер клетки
+    const UINT cellHeight = 256 >> 1;
     const UINT textureSize = rowPitch * 256;
 
     std::vector<UINT8> data(textureSize);
@@ -551,7 +551,19 @@ std::vector<UINT8> D3D12MeshletRender::GenerateTextureData()
 
 void D3D12MeshletRender::CreateTextureResources()
 {
-    // 1. Создаем ресурс текстуры
+    // ---------------------------------------------------------
+    // 1. Подготовка командного списка
+    // ---------------------------------------------------------
+    // Сбрасываем список команд и аллокатор.
+    // Важно: Мы предполагаем, что GPU не использует этот аллокатор прямо сейчас 
+    // (так как это происходит на этапе инициализации).
+    ThrowIfFailed(m_commandAllocators[m_frameIndex]->Reset());
+    ThrowIfFailed(m_commandList->Reset(m_commandAllocators[m_frameIndex].Get(), nullptr));
+
+    // ---------------------------------------------------------
+    // 2. Создание ресурсов
+    // ---------------------------------------------------------
+    // Описание текстуры
     D3D12_RESOURCE_DESC textureDesc = {};
     textureDesc.MipLevels = 1;
     textureDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -563,6 +575,7 @@ void D3D12MeshletRender::CreateTextureResources()
     textureDesc.SampleDesc.Quality = 0;
     textureDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
 
+    // Создаем саму текстуру (Default Heap - память GPU)
     const CD3DX12_HEAP_PROPERTIES defaultHeap(D3D12_HEAP_TYPE_DEFAULT);
     ThrowIfFailed(m_device->CreateCommittedResource(
         &defaultHeap,
@@ -572,9 +585,11 @@ void D3D12MeshletRender::CreateTextureResources()
         nullptr,
         IID_PPV_ARGS(&m_texture)));
 
-    // 2. Создаем буфер для загрузки данных (Upload Buffer)
-    const UINT64 uploadBufferSize = GetRequiredIntermediateSize(m_texture.Get(), 0, 1);
+    // Создаем буфер загрузки (Upload Heap - память CPU, доступная GPU)
+    // Используем ComPtr здесь, он будет жить до конца функции,
+    // а синхронизация в конце гарантирует, что GPU успеет всё прочитать.
     ComPtr<ID3D12Resource> textureUploadHeap;
+    const UINT64 uploadBufferSize = GetRequiredIntermediateSize(m_texture.Get(), 0, 1);
     const CD3DX12_HEAP_PROPERTIES uploadHeap(D3D12_HEAP_TYPE_UPLOAD);
     const CD3DX12_RESOURCE_DESC bufferDesc = CD3DX12_RESOURCE_DESC::Buffer(uploadBufferSize);
 
@@ -586,28 +601,69 @@ void D3D12MeshletRender::CreateTextureResources()
         nullptr,
         IID_PPV_ARGS(&textureUploadHeap)));
 
-    // 3. Копируем данные
+    // ---------------------------------------------------------
+    // 3. Загрузка данных
+    // ---------------------------------------------------------
     std::vector<UINT8> textureData = GenerateTextureData();
+    
     D3D12_SUBRESOURCE_DATA textureDataDesc = {};
     textureDataDesc.pData = &textureData[0];
-    textureDataDesc.RowPitch = 256 * 4;
+    textureDataDesc.RowPitch = 256 * 4; // Ширина * 4 байта (RGBA)
     textureDataDesc.SlicePitch = textureDataDesc.RowPitch * 256;
 
+    // Записываем команды копирования
     UpdateSubresources(m_commandList.Get(), m_texture.Get(), textureUploadHeap.Get(), 0, 0, 1, &textureDataDesc);
 
-    // 4. Переводим текстуру в состояние для чтения шейдером
-    const auto barrier = CD3DX12_RESOURCE_BARRIER::Transition(m_texture.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    // Барьер: переводим текстуру из состояния COPY_DEST в PIXEL_SHADER_RESOURCE
+    const auto barrier = CD3DX12_RESOURCE_BARRIER::Transition(
+        m_texture.Get(), 
+        D3D12_RESOURCE_STATE_COPY_DEST, 
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     m_commandList->ResourceBarrier(1, &barrier);
 
-    // 5. Создаем SRV (представление ресурса) в куче дескрипторов
+    // ---------------------------------------------------------
+    // 4. Создание SRV (Descriptor View)
+    // ---------------------------------------------------------
     D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
     srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     srvDesc.Format = textureDesc.Format;
     srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     srvDesc.Texture2D.MipLevels = 1;
-    m_device->CreateShaderResourceView(m_texture.Get(), &srvDesc, m_srvHeap->GetCPUDescriptorHandleForHeapStart());
     
-    // Важно: uploadHeap должен жить до конца выполнения команд на GPU. 
-    // В данном примере мы вызываем WaitForGpu сразу после загрузки ассетов, поэтому это безопасно.
-    // Если WaitForGpu убрать, uploadHeap уничтожится раньше времени, и будет краш.
+    // Создаем view в начале кучи дескрипторов (offset 0)
+    m_device->CreateShaderResourceView(m_texture.Get(), &srvDesc, m_srvHeap->GetCPUDescriptorHandleForHeapStart());
+
+    // ---------------------------------------------------------
+    // 5. Выполнение и БЕЗОПАСНАЯ СИНХРОНИЗАЦИЯ
+    // ---------------------------------------------------------
+    ThrowIfFailed(m_commandList->Close());
+    ID3D12CommandList* ppCommandLists[] = { m_commandList.Get() };
+    m_commandQueue->ExecuteCommandLists(_countof(ppCommandLists), ppCommandLists);
+
+    // --- ВМЕСТО WaitForGpu() используем локальный Fence ---
+    // Это предотвращает конфликт с глобальным состоянием рендера и краши.
+    
+    ComPtr<ID3D12Fence> uploadFence;
+    ThrowIfFailed(m_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&uploadFence)));
+
+    m_commandQueue->Signal(uploadFence.Get(), 1);
+
+    HANDLE waitEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+    if (waitEvent == nullptr)
+    {
+        ThrowIfFailed(HRESULT_FROM_WIN32(GetLastError()));
+    }
+
+    // Если значение еще не 1, ждем
+    if (uploadFence->GetCompletedValue() < 1)
+    {
+        ThrowIfFailed(uploadFence->SetEventOnCompletion(1, waitEvent));
+        WaitForSingleObject(waitEvent, INFINITE);
+    }
+    
+    CloseHandle(waitEvent);
+    
+    // Теперь GPU точно закончил копирование из textureUploadHeap.
+    // Функция завершается, textureUploadHeap удаляется (умный указатель), 
+    // но это безопасно, так как данные уже в m_texture (на GPU).
 }
