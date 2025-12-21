@@ -13,10 +13,13 @@
 #pragma comment(lib, "dxguid.lib")
 #include "D3D12MeshletRender.h"
 
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
+
 #include <iostream>
 #include <ostream>
 
-const wchar_t* D3D12MeshletRender::c_meshFilename = L"..\\Assets\\Suvorov.bin";
+const wchar_t* D3D12MeshletRender::c_meshFilename = L"..\\Assets\\hamster.bin";
 
 const wchar_t* D3D12MeshletRender::c_meshShaderFilename = L"MeshletMS.cso";
 const wchar_t* D3D12MeshletRender::c_pixelShaderFilename = L"MeshletPS.cso";
@@ -551,119 +554,89 @@ std::vector<UINT8> D3D12MeshletRender::GenerateTextureData()
 
 void D3D12MeshletRender::CreateTextureResources()
 {
-    // ---------------------------------------------------------
-    // 1. Подготовка командного списка
-    // ---------------------------------------------------------
-    // Сбрасываем список команд и аллокатор.
-    // Важно: Мы предполагаем, что GPU не использует этот аллокатор прямо сейчас 
-    // (так как это происходит на этапе инициализации).
+    // 1. Загрузка изображения с диска с помощью stb_image
+    int width, height, channels;
+    // Force 4 channels (RGBA), так как DXGI_FORMAT_R8G8B8A8_UNORM требует 4 байта
+    const char* filename = "..\\Assets\\hamster.jpg"; // <--- УКАЖИТЕ ПУТЬ К ВАШЕЙ ТЕКСТУРЕ
+    unsigned char* pixels = stbi_load(filename, &width, &height, &channels, 4);
+
+    if (!pixels)
+    {
+        // Если текстура не найдена, создадим розовый квадрат (чтобы было видно ошибку)
+        width = 1; height = 1;
+        pixels = new unsigned char[4] { 255, 0, 255, 255 };
+        std::cerr << "Failed to load texture: " << filename << std::endl;
+    }
+
+    // 2. Подготовка командного списка
     ThrowIfFailed(m_commandAllocators[m_frameIndex]->Reset());
     ThrowIfFailed(m_commandList->Reset(m_commandAllocators[m_frameIndex].Get(), nullptr));
 
-    // ---------------------------------------------------------
-    // 2. Создание ресурсов
-    // ---------------------------------------------------------
-    // Описание текстуры
+    // 3. Создание ресурса текстуры на GPU
     D3D12_RESOURCE_DESC textureDesc = {};
     textureDesc.MipLevels = 1;
     textureDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    textureDesc.Width = 256;
-    textureDesc.Height = 256;
+    textureDesc.Width = width;
+    textureDesc.Height = height;
     textureDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
     textureDesc.DepthOrArraySize = 1;
     textureDesc.SampleDesc.Count = 1;
     textureDesc.SampleDesc.Quality = 0;
     textureDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
 
-    // Создаем саму текстуру (Default Heap - память GPU)
     const CD3DX12_HEAP_PROPERTIES defaultHeap(D3D12_HEAP_TYPE_DEFAULT);
     ThrowIfFailed(m_device->CreateCommittedResource(
-        &defaultHeap,
-        D3D12_HEAP_FLAG_NONE,
-        &textureDesc,
-        D3D12_RESOURCE_STATE_COPY_DEST,
-        nullptr,
-        IID_PPV_ARGS(&m_texture)));
+        &defaultHeap, D3D12_HEAP_FLAG_NONE, &textureDesc,
+        D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&m_texture)));
 
-    // Создаем буфер загрузки (Upload Heap - память CPU, доступная GPU)
-    // Используем ComPtr здесь, он будет жить до конца функции,
-    // а синхронизация в конце гарантирует, что GPU успеет всё прочитать.
-    ComPtr<ID3D12Resource> textureUploadHeap;
+    // 4. Создание буфера загрузки (Upload Heap)
     const UINT64 uploadBufferSize = GetRequiredIntermediateSize(m_texture.Get(), 0, 1);
+    ComPtr<ID3D12Resource> textureUploadHeap;
     const CD3DX12_HEAP_PROPERTIES uploadHeap(D3D12_HEAP_TYPE_UPLOAD);
     const CD3DX12_RESOURCE_DESC bufferDesc = CD3DX12_RESOURCE_DESC::Buffer(uploadBufferSize);
 
     ThrowIfFailed(m_device->CreateCommittedResource(
-        &uploadHeap,
-        D3D12_HEAP_FLAG_NONE,
-        &bufferDesc,
-        D3D12_RESOURCE_STATE_GENERIC_READ,
-        nullptr,
-        IID_PPV_ARGS(&textureUploadHeap)));
+        &uploadHeap, D3D12_HEAP_FLAG_NONE, &bufferDesc,
+        D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&textureUploadHeap)));
 
-    // ---------------------------------------------------------
-    // 3. Загрузка данных
-    // ---------------------------------------------------------
-    std::vector<UINT8> textureData = GenerateTextureData();
-    
+    // 5. Копирование данных
     D3D12_SUBRESOURCE_DATA textureDataDesc = {};
-    textureDataDesc.pData = &textureData[0];
-    textureDataDesc.RowPitch = 256 * 4; // Ширина * 4 байта (RGBA)
-    textureDataDesc.SlicePitch = textureDataDesc.RowPitch * 256;
+    textureDataDesc.pData = pixels;
+    textureDataDesc.RowPitch = width * 4; // ширина * 4 байта (RGBA)
+    textureDataDesc.SlicePitch = textureDataDesc.RowPitch * height;
 
-    // Записываем команды копирования
     UpdateSubresources(m_commandList.Get(), m_texture.Get(), textureUploadHeap.Get(), 0, 0, 1, &textureDataDesc);
 
-    // Барьер: переводим текстуру из состояния COPY_DEST в PIXEL_SHADER_RESOURCE
+    // Барьер
     const auto barrier = CD3DX12_RESOURCE_BARRIER::Transition(
-        m_texture.Get(), 
-        D3D12_RESOURCE_STATE_COPY_DEST, 
-        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        m_texture.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     m_commandList->ResourceBarrier(1, &barrier);
 
-    // ---------------------------------------------------------
-    // 4. Создание SRV (Descriptor View)
-    // ---------------------------------------------------------
+    // 6. Создание SRV
     D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
     srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     srvDesc.Format = textureDesc.Format;
     srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     srvDesc.Texture2D.MipLevels = 1;
-    
-    // Создаем view в начале кучи дескрипторов (offset 0)
     m_device->CreateShaderResourceView(m_texture.Get(), &srvDesc, m_srvHeap->GetCPUDescriptorHandleForHeapStart());
 
-    // ---------------------------------------------------------
-    // 5. Выполнение и БЕЗОПАСНАЯ СИНХРОНИЗАЦИЯ
-    // ---------------------------------------------------------
+    // 7. Выполнение и синхронизация
     ThrowIfFailed(m_commandList->Close());
     ID3D12CommandList* ppCommandLists[] = { m_commandList.Get() };
     m_commandQueue->ExecuteCommandLists(_countof(ppCommandLists), ppCommandLists);
 
-    // --- ВМЕСТО WaitForGpu() используем локальный Fence ---
-    // Это предотвращает конфликт с глобальным состоянием рендера и краши.
-    
     ComPtr<ID3D12Fence> uploadFence;
     ThrowIfFailed(m_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&uploadFence)));
-
     m_commandQueue->Signal(uploadFence.Get(), 1);
 
     HANDLE waitEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
-    if (waitEvent == nullptr)
-    {
-        ThrowIfFailed(HRESULT_FROM_WIN32(GetLastError()));
-    }
-
-    // Если значение еще не 1, ждем
     if (uploadFence->GetCompletedValue() < 1)
     {
         ThrowIfFailed(uploadFence->SetEventOnCompletion(1, waitEvent));
         WaitForSingleObject(waitEvent, INFINITE);
     }
-    
     CloseHandle(waitEvent);
-    
-    // Теперь GPU точно закончил копирование из textureUploadHeap.
-    // Функция завершается, textureUploadHeap удаляется (умный указатель), 
-    // но это безопасно, так как данные уже в m_texture (на GPU).
+
+    // Освобождаем память, выделенную stbi_load
+    if (pixels) stbi_image_free(pixels);
 }

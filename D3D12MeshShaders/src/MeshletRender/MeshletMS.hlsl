@@ -13,7 +13,7 @@
                   SRV(t3), \
                   SRV(t4), \
                   DescriptorTable(SRV(t5), visibility=SHADER_VISIBILITY_PIXEL), \
-                  StaticSampler(s0, filter=FILTER_MIN_MAG_MIP_POINT)"
+                  StaticSampler(s0, filter=FILTER_MIN_MAG_MIP_LINEAR)"
 
 struct Constants
 {
@@ -99,7 +99,7 @@ VertexOut GetVertexAttributes(uint meshletIndex, uint vertexIndex)
     
     // ВМЕСТО vout.UV = TexCoords[vertexIndex];
     // Генерируем UV из позиции (плоская проекция по осям X и Y)
-    vout.UV = v.Position.xy * 0.1; // Умножаем на 0.1, чтобы текстура не была слишком мелкой
+    vout.UV = TexCoords[vertexIndex];
 
     return vout;
 }
