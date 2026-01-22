@@ -1,9 +1,13 @@
 //*********************************************************
-// MeshletMS.hlsl
+//
+// Copyright (c) Microsoft. All rights reserved.
+// This code is licensed under the MIT License (MIT).
+// THIS CODE IS PROVIDED *AS IS* WITHOUT WARRANTY OF
+// ANY KIND, EITHER EXPRESS OR IMPLIED, INCLUDING ANY
+// IMPLIED WARRANTIES OF FITNESS FOR A PARTICULAR
+// PURPOSE, MERCHANTABILITY, OR NON-INFRINGEMENT.
+//
 //*********************************************************
-
-// ВАЖНО: Мы добавили SRV(t4) для буфера UV, DescriptorTable для текстуры (t5)
-// и StaticSampler для сэмплинга.
 
 #define ROOT_SIG "CBV(b0), \
                   RootConstants(b1, num32bitconstants=2), \
@@ -11,9 +15,8 @@
                   SRV(t1), \
                   SRV(t2), \
                   SRV(t3), \
-                  SRV(t4), \
-                  DescriptorTable(SRV(t5), visibility=SHADER_VISIBILITY_PIXEL), \
-                  StaticSampler(s0, filter=FILTER_MIN_MAG_MIP_LINEAR)"
+                  DescriptorTable(SRV(t4)), \
+                  StaticSampler(s0, filter=FILTER_MIN_MAG_MIP_LINEAR, addressU=TEXTURE_ADDRESS_WRAP, addressV=TEXTURE_ADDRESS_WRAP, addressW=TEXTURE_ADDRESS_WRAP)"
 
 struct Constants
 {
@@ -33,15 +36,16 @@ struct Vertex
 {
     float3 Position;
     float3 Normal;
+    float2 TexCoord;
 };
 
 struct VertexOut
 {
-    float4 PositionHS   : SV_Position;
-    float3 PositionVS   : POSITION0;
-    float3 Normal       : NORMAL0;
-    float2 UV           : TEXCOORD0; // <--- Добавили UV
-    uint   MeshletIndex : COLOR0;
+    float4 PositionHS : SV_Position;
+    float3 PositionVS : POSITION0;
+    float3 Normal : NORMAL0;
+    float2 TexCoord : TEXCOORD0;
+    uint MeshletIndex : COLOR0;
 };
 
 struct Meshlet
@@ -54,15 +58,19 @@ struct Meshlet
 
 ConstantBuffer<Constants> Globals             : register(b0);
 ConstantBuffer<MeshInfo>  MeshInfo            : register(b1);
+
 StructuredBuffer<Vertex>  Vertices            : register(t0);
 StructuredBuffer<Meshlet> Meshlets            : register(t1);
 ByteAddressBuffer         UniqueVertexIndices : register(t2);
 StructuredBuffer<uint>    PrimitiveIndices    : register(t3);
-StructuredBuffer<float2>  TexCoords           : register(t4); // <--- Новый буфер
 
-// ... (Функции UnpackPrimitive и GetPrimitive остаются без изменений) ...
+
+/////
+// Data Loaders
+
 uint3 UnpackPrimitive(uint primitive)
 {
+    // Unpacks a 10 bits per index triangle from a 32-bit uint.
     return uint3(primitive & 0x3FF, (primitive >> 10) & 0x3FF, (primitive >> 20) & 0x3FF);
 }
 
@@ -71,18 +79,24 @@ uint3 GetPrimitive(Meshlet m, uint index)
     return UnpackPrimitive(PrimitiveIndices[m.PrimOffset + index]);
 }
 
-// ... (Функция GetVertexIndex остается без изменений) ...
 uint GetVertexIndex(Meshlet m, uint localIndex)
 {
     localIndex = m.VertOffset + localIndex;
-    if (MeshInfo.IndexBytes == 4) 
-        return UniqueVertexIndices.Load(localIndex * 4);
-    else 
+
+    if (MeshInfo.IndexBytes == 4) // 32-bit Vertex Indices
     {
+        return UniqueVertexIndices.Load(localIndex * 4);
+    }
+    else // 16-bit Vertex Indices
+    {
+        // Byte address must be 4-byte aligned.
         uint wordOffset = (localIndex & 0x1);
         uint byteOffset = (localIndex / 2) * 4;
+
+        // Grab the pair of 16-bit indices, shift & mask off proper 16-bits.
         uint indexPair = UniqueVertexIndices.Load(byteOffset);
         uint index = (indexPair >> (wordOffset * 16)) & 0xffff;
+
         return index;
     }
 }
@@ -90,19 +104,17 @@ uint GetVertexIndex(Meshlet m, uint localIndex)
 VertexOut GetVertexAttributes(uint meshletIndex, uint vertexIndex)
 {
     Vertex v = Vertices[vertexIndex];
-    VertexOut vout;
 
+    VertexOut vout;
     vout.PositionVS = mul(float4(v.Position, 1), Globals.WorldView).xyz;
     vout.PositionHS = mul(float4(v.Position, 1), Globals.WorldViewProj);
     vout.Normal = mul(float4(v.Normal, 0), Globals.World).xyz;
     vout.MeshletIndex = meshletIndex;
-    
-    // ВМЕСТО vout.UV = TexCoords[vertexIndex];
-    // Генерируем UV из позиции (плоская проекция по осям X и Y)
-    vout.UV = TexCoords[vertexIndex];
+    vout.TexCoord = v.TexCoord;
 
     return vout;
 }
+
 
 [RootSignature(ROOT_SIG)]
 [NumThreads(128, 1, 1)]
@@ -115,6 +127,7 @@ void main(
 )
 {
     Meshlet m = Meshlets[MeshInfo.MeshletOffset + gid];
+
     SetMeshOutputCounts(m.VertCount, m.PrimCount);
 
     if (gtid < m.PrimCount)

@@ -19,18 +19,17 @@ struct Constants
 
 struct VertexOut
 {
-    float4 PositionHS   : SV_Position;
-    float3 PositionVS   : POSITION0;
-    float3 Normal       : NORMAL0;
-    float2 UV           : TEXCOORD0; // <--- Принимаем UV
-    uint   MeshletIndex : COLOR0;
+    float4 PositionHS : SV_Position;
+    float3 PositionVS : POSITION0;
+    float3 Normal : NORMAL0;
+    float2 TexCoord : TEXCOORD0;
+    uint MeshletIndex : COLOR0;
 };
 
 ConstantBuffer<Constants> Globals : register(b0);
 
-// Объявляем текстуру и сэмплер
-Texture2D    g_texture : register(t5);
-SamplerState g_sampler : register(s0);
+Texture2D gAlbedo : register(t4);
+SamplerState gSamp : register(s0);
 
 float4 main(VertexOut input) : SV_TARGET
 {
@@ -38,28 +37,30 @@ float4 main(VertexOut input) : SV_TARGET
     float3 lightColor = float3(1, 1, 1);
     float3 lightDir = -normalize(float3(1, -1, 1));
 
-    // Сэмплируем цвет из текстуры
-    float4 textureColor = g_texture.Sample(g_sampler, input.UV);
-
     float3 diffuseColor;
     float shininess;
 
     if (Globals.DrawMeshlets)
     {
-        // Смешиваем режим Meshlets с текстурой для наглядности (опционально)
-        // Или просто используем текстуру:
-        diffuseColor = textureColor.rgb; 
+        uint meshletIndex = input.MeshletIndex;
+        diffuseColor = float3(
+            float(meshletIndex & 1),
+            float(meshletIndex & 3) / 4,
+            float(meshletIndex & 7) / 8);
         shininess = 16.0;
     }
     else
     {
-        diffuseColor = textureColor.rgb;
+        float2 uv = input.TexCoord;
+        uv.y = 1.0 - uv.y;
+
+        diffuseColor = gAlbedo.Sample(gSamp, uv).rgb;
         shininess = 64.0;
     }
 
     float3 normal = normalize(input.Normal);
 
-    // Blinn-Phong
+    // Do some fancy Blinn-Phong shading!
     float cosAngle = saturate(dot(normal, lightDir));
     float3 viewDir = -normalize(input.PositionVS);
     float3 halfAngle = normalize(lightDir + viewDir);
@@ -71,5 +72,4 @@ float4 main(VertexOut input) : SV_TARGET
     float3 finalColor = (cosAngle + blinnTerm + ambientIntensity) * diffuseColor;
 
     return float4(finalColor, 1);
-    //return float4(input.UV, 0, 1);
 }

@@ -10,22 +10,151 @@
 //*********************************************************
 
 #include "stdafx.h"
-#pragma comment(lib, "dxguid.lib")
 #include "D3D12MeshletRender.h"
+#include <wincodec.h>
+#include <vector>
 
-#define STB_IMAGE_IMPLEMENTATION
-#include "stb_image.h"
-
-#include <iostream>
-#include <ostream>
-
-const wchar_t* D3D12MeshletRender::c_meshFilename = L"..\\Assets\\hamster.bin";
+const wchar_t* D3D12MeshletRender::c_meshFilename = L"..\\Assets\\hamster_nanite.bin";
+const wchar_t* c_texturePath = L"..\\Assets\\hamster.jpg";
 
 const wchar_t* D3D12MeshletRender::c_meshShaderFilename = L"MeshletMS.cso";
 const wchar_t* D3D12MeshletRender::c_pixelShaderFilename = L"MeshletPS.cso";
 
 extern "C" { __declspec(dllexport) extern const UINT D3D12SDKVersion = 618; }
 extern "C" { __declspec(dllexport) extern const char* D3D12SDKPath = u8".\\D3D12\\"; }
+
+
+namespace texb
+{
+    struct CpuImageRGBA
+    {
+        UINT w = 0, h = 0;
+        std::vector<uint8_t> rgba; // w*h*4
+    };
+
+    static Microsoft::WRL::ComPtr<IWICImagingFactory> GetWicFactory()
+    {
+        static Microsoft::WRL::ComPtr<IWICImagingFactory> s_factory;
+        if (!s_factory)
+        {
+            ThrowIfFailed(CoInitializeEx(nullptr, COINIT_MULTITHREADED));
+            ThrowIfFailed(CoCreateInstance(
+                CLSID_WICImagingFactory2, nullptr, CLSCTX_INPROC_SERVER,
+                IID_PPV_ARGS(&s_factory)));
+        }
+        return s_factory;
+    }
+
+    static CpuImageRGBA DecodeToRGBA32(const wchar_t* file)
+    {
+        CpuImageRGBA out;
+
+        auto factory = GetWicFactory();
+
+        Microsoft::WRL::ComPtr<IWICBitmapDecoder> decoder;
+        ThrowIfFailed(factory->CreateDecoderFromFilename(
+            file, nullptr, GENERIC_READ, WICDecodeMetadataCacheOnDemand, &decoder));
+
+        Microsoft::WRL::ComPtr<IWICBitmapFrameDecode> frame;
+        ThrowIfFailed(decoder->GetFrame(0, &frame));
+
+        ThrowIfFailed(frame->GetSize(&out.w, &out.h));
+
+        Microsoft::WRL::ComPtr<IWICFormatConverter> conv;
+        ThrowIfFailed(factory->CreateFormatConverter(&conv));
+        ThrowIfFailed(conv->Initialize(
+            frame.Get(),
+            GUID_WICPixelFormat32bppRGBA,
+            WICBitmapDitherTypeNone,
+            nullptr,
+            0.0,
+            WICBitmapPaletteTypeCustom));
+
+        out.rgba.resize(size_t(out.w) * size_t(out.h) * 4);
+        ThrowIfFailed(conv->CopyPixels(
+            nullptr,
+            out.w * 4,
+            (UINT)out.rgba.size(),
+            out.rgba.data()));
+
+        return out;
+    }
+
+    static void CreateTexture2D_AndUpload(
+        ID3D12Device* device,
+        ID3D12GraphicsCommandList* cmd,
+        const CpuImageRGBA& img,
+        Microsoft::WRL::ComPtr<ID3D12Resource>& tex,
+        Microsoft::WRL::ComPtr<ID3D12Resource>& upload)
+    {
+        D3D12_RESOURCE_DESC desc = {};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        desc.Width = img.w;
+        desc.Height = img.h;
+        desc.DepthOrArraySize = 1;
+        desc.MipLevels = 1;
+        desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        desc.SampleDesc.Count = 1;
+        desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+
+        const CD3DX12_HEAP_PROPERTIES depthStencilHeapPropsDef(D3D12_HEAP_TYPE_DEFAULT);
+        const CD3DX12_HEAP_PROPERTIES depthStencilHeapPropsUpl(D3D12_HEAP_TYPE_UPLOAD);
+
+        ThrowIfFailed(device->CreateCommittedResource(
+            &depthStencilHeapPropsDef,
+            D3D12_HEAP_FLAG_NONE,
+            &desc,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            nullptr,
+            IID_PPV_ARGS(&tex)));
+
+        UINT64 uploadBytes = 0;
+        device->GetCopyableFootprints(&desc, 0, 1, 0, nullptr, nullptr, nullptr, &uploadBytes);
+        auto uploadBufDesc = CD3DX12_RESOURCE_DESC::Buffer(uploadBytes);
+
+        ThrowIfFailed(device->CreateCommittedResource(
+            &depthStencilHeapPropsUpl,
+            D3D12_HEAP_FLAG_NONE,
+            &uploadBufDesc,
+            D3D12_RESOURCE_STATE_GENERIC_READ,
+            nullptr,
+            IID_PPV_ARGS(&upload)));
+
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp = {};
+        UINT rows = 0;
+        UINT64 rowBytes = 0, totalBytes = 0;
+        device->GetCopyableFootprints(&desc, 0, 1, 0, &fp, &rows, &rowBytes, &totalBytes);
+
+        uint8_t* dst = nullptr;
+        ThrowIfFailed(upload->Map(0, nullptr, (void**)&dst));
+        for (UINT y = 0; y < img.h; ++y)
+        {
+            memcpy(dst + fp.Offset + size_t(y) * fp.Footprint.RowPitch,
+                img.rgba.data() + size_t(y) * size_t(img.w) * 4,
+                size_t(img.w) * 4);
+        }
+        upload->Unmap(0, nullptr);
+
+        D3D12_TEXTURE_COPY_LOCATION dstLoc = {};
+        dstLoc.pResource = tex.Get();
+        dstLoc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        dstLoc.SubresourceIndex = 0;
+
+        D3D12_TEXTURE_COPY_LOCATION srcLoc = {};
+        srcLoc.pResource = upload.Get();
+        srcLoc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        srcLoc.PlacedFootprint = fp;
+
+        cmd->CopyTextureRegion(&dstLoc, 0, 0, 0, &srcLoc, nullptr);
+
+        auto barrier = CD3DX12_RESOURCE_BARRIER::Transition(
+            tex.Get(),
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        cmd->ResourceBarrier(1, &barrier);
+    }
+}
+
 
 D3D12MeshletRender::D3D12MeshletRender(UINT width, UINT height, std::wstring name)
     : DXSample(width, height, name)
@@ -41,6 +170,7 @@ D3D12MeshletRender::D3D12MeshletRender(UINT width, UINT height, std::wstring nam
     , m_fenceValues{}
 { }
 
+
 void D3D12MeshletRender::OnInit()
 {
     m_camera.Init({ 0, 75, 150 });
@@ -49,6 +179,45 @@ void D3D12MeshletRender::OnInit()
     LoadPipeline();
     LoadAssets();
 }
+
+
+void D3D12MeshletRender::InitAlbedoResources()
+{
+    // 1) heap for SRV
+    if (m_cbvSrvUavInc == 0)
+        m_cbvSrvUavInc = m_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+
+    D3D12_DESCRIPTOR_HEAP_DESC hd = {};
+    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    hd.NumDescriptors = 1;
+    hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    ThrowIfFailed(m_device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&m_albedo.Heap)));
+
+    // 2) decode + upload
+    auto img = texb::DecodeToRGBA32(c_texturePath);
+    texb::CreateTexture2D_AndUpload(m_device.Get(), m_commandList.Get(), img, m_albedo.Tex, m_albedo.Upload);
+
+    // 3) SRV creation
+    D3D12_SHADER_RESOURCE_VIEW_DESC sd = {};
+    sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    sd.Texture2D.MipLevels = 1;
+
+    CD3DX12_CPU_DESCRIPTOR_HANDLE cpu(m_albedo.Heap->GetCPUDescriptorHandleForHeapStart());
+    m_device->CreateShaderResourceView(m_albedo.Tex.Get(), &sd, cpu);
+}
+
+
+void D3D12MeshletRender::BindAlbedoTexture()
+{
+    ID3D12DescriptorHeap* heaps[] = { m_albedo.Heap.Get() };
+    m_commandList->SetDescriptorHeaps(1, heaps);
+
+    // Root param 6 - ROOT_SIG (DescriptorTable(SRV(t4)))
+    m_commandList->SetGraphicsRootDescriptorTable(6, m_albedo.Heap->GetGPUDescriptorHandleForHeapStart());
+}
+
 
 // Load the rendering pipeline dependencies.
 void D3D12MeshletRender::LoadPipeline()
@@ -164,15 +333,6 @@ void D3D12MeshletRender::LoadPipeline()
         ThrowIfFailed(m_device->CreateDescriptorHeap(&dsvHeapDesc, IID_PPV_ARGS(&m_dsvHeap)));
 
         m_dsvDescriptorSize = m_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
-
-        // Describe and create a shader resource view (SRV) heap for the texture.
-        D3D12_DESCRIPTOR_HEAP_DESC srvHeapDesc = {};
-        srvHeapDesc.NumDescriptors = 1; // Нам нужна 1 текстура
-        srvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-        srvHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE; // ВАЖНО: Видима шейдеру!
-        ThrowIfFailed(m_device->CreateDescriptorHeap(&srvHeapDesc, IID_PPV_ARGS(&m_srvHeap)));
-
-        m_srvDescriptorSize = m_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     }
 
     // Create frame resources.
@@ -288,8 +448,6 @@ void D3D12MeshletRender::LoadAssets()
     // Create the command list.
     ThrowIfFailed(m_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, m_commandAllocators[m_frameIndex].Get(), m_pipelineState.Get(), IID_PPV_ARGS(&m_commandList)));
 
-    
-
     // Command lists are created in the recording state, but there is nothing
     // to record yet. The main loop expects it to be closed, so close it now.
     ThrowIfFailed(m_commandList->Close());
@@ -297,19 +455,26 @@ void D3D12MeshletRender::LoadAssets()
     m_model.LoadFromFile(c_meshFilename);
     m_model.UploadGpuResources(m_device.Get(), m_commandQueue.Get(), m_commandAllocators[m_frameIndex].Get(), m_commandList.Get());
 
-    CreateTextureResources();
+    ThrowIfFailed(m_commandAllocators[m_frameIndex]->Reset());
+    ThrowIfFailed(m_commandList->Reset(m_commandAllocators[m_frameIndex].Get(), m_pipelineState.Get()));
+
+    InitAlbedoResources();
+
+    ThrowIfFailed(m_commandList->Close());
+    ID3D12CommandList* lists[] = { m_commandList.Get() };
+    m_commandQueue->ExecuteCommandLists(1, lists);
 
 #ifdef _DEBUG
-    // Mesh shader file expects a certain vertex layout; assert our mesh conforms to that layout.
-    const D3D12_INPUT_ELEMENT_DESC c_elementDescs[2] =
+    const D3D12_INPUT_ELEMENT_DESC c_elementDescs[3] =
     {
         { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, D3D12_APPEND_ALIGNED_ELEMENT, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 1 },
-        { "NORMAL", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, D3D12_APPEND_ALIGNED_ELEMENT, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 1 },
+        { "NORMAL",   0, DXGI_FORMAT_R32G32B32_FLOAT, 0, D3D12_APPEND_ALIGNED_ELEMENT, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 1 },
+        { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT,    0, D3D12_APPEND_ALIGNED_ELEMENT, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 1 },
     };
 
     for (auto& mesh : m_model)
     {
-        assert(mesh.LayoutDesc.NumElements == 2);
+        assert(mesh.LayoutDesc.NumElements == 3);
 
         for (uint32_t i = 0; i < _countof(c_elementDescs); ++i)
             assert(std::memcmp(&mesh.LayoutElems[i], &c_elementDescs[i], sizeof(D3D12_INPUT_ELEMENT_DESC)) == 0);
@@ -349,15 +514,15 @@ void D3D12MeshletRender::OnUpdate()
     }
 
     m_camera.Update(static_cast<float>(m_timer.GetElapsedSeconds()));
-
-    XMMATRIX world = XMMATRIX(g_XMIdentityR0, g_XMIdentityR1, g_XMIdentityR2, g_XMIdentityR3);
+    
+    XMMATRIX world = XMMatrixScaling(10, 10, 10)* XMMatrixTranslation(0.0f, 50.0f, 0.0f);
     XMMATRIX view = m_camera.GetViewMatrix();
     XMMATRIX proj = m_camera.GetProjectionMatrix(XM_PI / 3.0f, m_aspectRatio);
     
     XMStoreFloat4x4(&m_constantBufferData.World, XMMatrixTranspose(world));
     XMStoreFloat4x4(&m_constantBufferData.WorldView, XMMatrixTranspose(world * view));
     XMStoreFloat4x4(&m_constantBufferData.WorldViewProj, XMMatrixTranspose(world * view * proj));
-    m_constantBufferData.DrawMeshlets = true;
+    m_constantBufferData.DrawMeshlets = false;
 
     memcpy(m_cbvDataBegin + sizeof(SceneConstantBuffer) * m_frameIndex, &m_constantBufferData, sizeof(m_constantBufferData));
 }
@@ -411,6 +576,9 @@ void D3D12MeshletRender::PopulateCommandList()
 
     // Set necessary state.
     m_commandList->SetGraphicsRootSignature(m_rootSignature.Get());
+
+    BindAlbedoTexture();
+
     m_commandList->RSSetViewports(1, &m_viewport);
     m_commandList->RSSetScissorRects(1, &m_scissorRect);
 
@@ -427,46 +595,15 @@ void D3D12MeshletRender::PopulateCommandList()
     m_commandList->ClearRenderTargetView(rtvHandle, clearColor, 0, nullptr);
     m_commandList->ClearDepthStencilView(dsvHandle, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
 
-    ID3D12DescriptorHeap* ppHeaps[] = { m_srvHeap.Get() };
-    m_commandList->SetDescriptorHeaps(_countof(ppHeaps), ppHeaps);
-
     m_commandList->SetGraphicsRootConstantBufferView(0, m_constantBuffer->GetGPUVirtualAddress() + sizeof(SceneConstantBuffer) * m_frameIndex);
 
     for (auto& mesh : m_model)
     {
-        // 0: CBV, 1: Constants
         m_commandList->SetGraphicsRoot32BitConstant(1, mesh.IndexSize, 0);
-        
-        // 2: SRV(t0) - Позиции
         m_commandList->SetGraphicsRootShaderResourceView(2, mesh.VertexResources[0]->GetGPUVirtualAddress());
-        
-        // 3: SRV(t1) - Мешлеты
         m_commandList->SetGraphicsRootShaderResourceView(3, mesh.MeshletResource->GetGPUVirtualAddress());
-        
-        // 4: SRV(t2) - Уникальные индексы вершин
         m_commandList->SetGraphicsRootShaderResourceView(4, mesh.UniqueVertexIndexResource->GetGPUVirtualAddress());
-        
-        // 5: SRV(t3) - Индексы примитивов
         m_commandList->SetGraphicsRootShaderResourceView(5, mesh.PrimitiveIndexResource->GetGPUVirtualAddress());
-
-        // --- НОВОЕ: 6: SRV(t4) - UV координаты ---
-        auto uvAddress = mesh.GetUVBufferAddress();
-        if (uvAddress != 0)
-        {
-            std::cout << "INFO: Setting UV buffer SRV." << std::endl;
-            m_commandList->SetGraphicsRootShaderResourceView(6, uvAddress);
-        }
-        else
-        {
-            //std::cout << "WARNING: Mesh has no UV buffer; setting null SRV for UVs." << std::endl;
-            // Если UV нет, ставим null (или любой валидный адрес во избежание краша, но лучше иметь UV)
-            m_commandList->SetGraphicsRootShaderResourceView(6, mesh.VertexResources[0]->GetGPUVirtualAddress());
-        }
-
-        // --- НОВОЕ: 7: DescriptorTable(t5) - Текстура ---
-        // Передаем GPU handle начала кучи, где лежит наш дескриптор текстуры
-        m_commandList->SetGraphicsRootDescriptorTable(7, m_srvHeap->GetGPUDescriptorHandleForHeapStart());
-
 
         for (auto& subset : mesh.MeshletSubsets)
         {
@@ -515,128 +652,4 @@ void D3D12MeshletRender::MoveToNextFrame()
 
     // Set the fence value for the next frame.
     m_fenceValues[m_frameIndex] = currentFenceValue + 1;
-}
-
-std::vector<UINT8> D3D12MeshletRender::GenerateTextureData()
-{
-    const UINT rowPitch = 256 * 4; // Ширина 256 пикселей, 4 байта (RGBA)
-    const UINT cellPitch = rowPitch >> 1; // Размер клетки
-    const UINT cellHeight = 256 >> 1;
-    const UINT textureSize = rowPitch * 256;
-
-    std::vector<UINT8> data(textureSize);
-    UINT8* pData = &data[0];
-
-    for (UINT n = 0; n < textureSize; n += 4)
-    {
-        UINT x = n % rowPitch;
-        UINT y = n / rowPitch;
-        UINT i = x / cellPitch;
-        UINT j = y / cellHeight;
-
-        if (i % 2 == j % 2)
-        {
-            pData[n] = 0x00;     // R
-            pData[n + 1] = 0x00; // G
-            pData[n + 2] = 0x00; // B
-            pData[n + 3] = 0xff; // A
-        }
-        else
-        {
-            pData[n] = 0xff;     // R
-            pData[n + 1] = 0xff; // G
-            pData[n + 2] = 0xff; // B
-            pData[n + 3] = 0xff; // A
-        }
-    }
-    return data;
-}
-
-void D3D12MeshletRender::CreateTextureResources()
-{
-    // 1. Загрузка изображения с диска с помощью stb_image
-    int width, height, channels;
-    // Force 4 channels (RGBA), так как DXGI_FORMAT_R8G8B8A8_UNORM требует 4 байта
-    const char* filename = "..\\Assets\\hamster.jpg"; // <--- УКАЖИТЕ ПУТЬ К ВАШЕЙ ТЕКСТУРЕ
-    unsigned char* pixels = stbi_load(filename, &width, &height, &channels, 4);
-
-    if (!pixels)
-    {
-        // Если текстура не найдена, создадим розовый квадрат (чтобы было видно ошибку)
-        width = 1; height = 1;
-        pixels = new unsigned char[4] { 255, 0, 255, 255 };
-        std::cerr << "Failed to load texture: " << filename << std::endl;
-    }
-
-    // 2. Подготовка командного списка
-    ThrowIfFailed(m_commandAllocators[m_frameIndex]->Reset());
-    ThrowIfFailed(m_commandList->Reset(m_commandAllocators[m_frameIndex].Get(), nullptr));
-
-    // 3. Создание ресурса текстуры на GPU
-    D3D12_RESOURCE_DESC textureDesc = {};
-    textureDesc.MipLevels = 1;
-    textureDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    textureDesc.Width = width;
-    textureDesc.Height = height;
-    textureDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
-    textureDesc.DepthOrArraySize = 1;
-    textureDesc.SampleDesc.Count = 1;
-    textureDesc.SampleDesc.Quality = 0;
-    textureDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-
-    const CD3DX12_HEAP_PROPERTIES defaultHeap(D3D12_HEAP_TYPE_DEFAULT);
-    ThrowIfFailed(m_device->CreateCommittedResource(
-        &defaultHeap, D3D12_HEAP_FLAG_NONE, &textureDesc,
-        D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&m_texture)));
-
-    // 4. Создание буфера загрузки (Upload Heap)
-    const UINT64 uploadBufferSize = GetRequiredIntermediateSize(m_texture.Get(), 0, 1);
-    ComPtr<ID3D12Resource> textureUploadHeap;
-    const CD3DX12_HEAP_PROPERTIES uploadHeap(D3D12_HEAP_TYPE_UPLOAD);
-    const CD3DX12_RESOURCE_DESC bufferDesc = CD3DX12_RESOURCE_DESC::Buffer(uploadBufferSize);
-
-    ThrowIfFailed(m_device->CreateCommittedResource(
-        &uploadHeap, D3D12_HEAP_FLAG_NONE, &bufferDesc,
-        D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&textureUploadHeap)));
-
-    // 5. Копирование данных
-    D3D12_SUBRESOURCE_DATA textureDataDesc = {};
-    textureDataDesc.pData = pixels;
-    textureDataDesc.RowPitch = width * 4; // ширина * 4 байта (RGBA)
-    textureDataDesc.SlicePitch = textureDataDesc.RowPitch * height;
-
-    UpdateSubresources(m_commandList.Get(), m_texture.Get(), textureUploadHeap.Get(), 0, 0, 1, &textureDataDesc);
-
-    // Барьер
-    const auto barrier = CD3DX12_RESOURCE_BARRIER::Transition(
-        m_texture.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-    m_commandList->ResourceBarrier(1, &barrier);
-
-    // 6. Создание SRV
-    D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
-    srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    srvDesc.Format = textureDesc.Format;
-    srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-    srvDesc.Texture2D.MipLevels = 1;
-    m_device->CreateShaderResourceView(m_texture.Get(), &srvDesc, m_srvHeap->GetCPUDescriptorHandleForHeapStart());
-
-    // 7. Выполнение и синхронизация
-    ThrowIfFailed(m_commandList->Close());
-    ID3D12CommandList* ppCommandLists[] = { m_commandList.Get() };
-    m_commandQueue->ExecuteCommandLists(_countof(ppCommandLists), ppCommandLists);
-
-    ComPtr<ID3D12Fence> uploadFence;
-    ThrowIfFailed(m_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&uploadFence)));
-    m_commandQueue->Signal(uploadFence.Get(), 1);
-
-    HANDLE waitEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
-    if (uploadFence->GetCompletedValue() < 1)
-    {
-        ThrowIfFailed(uploadFence->SetEventOnCompletion(1, waitEvent));
-        WaitForSingleObject(waitEvent, INFINITE);
-    }
-    CloseHandle(waitEvent);
-
-    // Освобождаем память, выделенную stbi_load
-    if (pixels) stbi_image_free(pixels);
 }
